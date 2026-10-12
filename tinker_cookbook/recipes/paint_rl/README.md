@@ -1,0 +1,217 @@
+# Paint with code: RL with a multimodal LLM-as-a-Verifier (and an LLM-as-a-Judge baseline)
+
+Teach `thinkingmachines/Inkling-Small` to paint watercolors by writing
+[p5.brush](https://github.com/acamposuribe/p5.brush) sketches. The policy writes
+a JavaScript sketch, the sketch is rendered headlessly to a PNG, a multimodal
+model scores the *image*, and group-centered rewards update the policy. The
+task follows ["Training AI to Paint with Code"](https://surya.website/rling-qwen-to-paint-with-code).
+
+The reward is where this recipe differs. That project scored each image on an
+absolute 0-10 scale and found the scores compressed and training stalled.
+Here, rewards come from
+[LLM-as-a-Verifier](https://github.com/llm-as-a-verifier/llm-as-a-verifier):
+pairwise comparisons on a fine-grained 20-letter scale, one narrow criterion
+per call, repeated with the two image slots swapped, and aggregated over a
+round-robin tournament within each rollout group. Each comparison is one
+`llm_verifier.compare` call from the
+[`llm-verifier`](https://pypi.org/project/llm-verifier/) package. Inkling-Small
+is its own verifier: the same base model, sampled at thinking effort 0.2 ("low"), looks
+at the two rendered paintings through its native image input.
+
+`reward_mode=judge` swaps in the classic **LLM-as-a-Judge** baseline: the
+same model at the same effort scores each painting on its own, once, as an
+integer 1-10 on a single overall criterion. Everything else (policy, prompts,
+batch, reward weights, token budget, concurrency) is shared, so the two runs
+differ only in how the paintings are scored.
+
+| Role | Model | Notes |
+|---|---|---|
+| Policy | `thinkingmachines/Inkling-Small` | LoRA rank 32, `tml_v0` renderer, thinking effort 0.7, 8k token budget |
+| Training reward, `verifier` | `thinkingmachines/Inkling-Small` | `llm_verifier.compare` over Tinker's OpenAI-compatible endpoint, thinking effort 0.2, token logprobs, pairwise round-robin tournament, 2 repeats |
+| Training reward, `judge` | `thinkingmachines/Inkling-Small` | Same endpoint, thinking effort 0.2; absolute 1-10 per painting, one overall criterion, 1 call |
+| Held-out evaluator | `moonshotai/Kimi-K2.6` | Tinker's native sampler; separate from the reward and never trained against |
+
+## Running
+
+```bash
+pip install -e ".[paint-rl]"     # llm-verifier, openai, google-genai, playwright
+python -m playwright install --with-deps chromium
+
+export TINKER_API_KEY=...   # policy, reward model and held-out evaluator all run on Tinker
+
+# LLM-as-a-Verifier
+python -m tinker_cookbook.recipes.paint_rl.train reward_mode=verifier log_path=/tmp/paint_rl/verifier
+# LLM-as-a-Judge baseline (separately, or at the same time in another shell)
+python -m tinker_cookbook.recipes.paint_rl.train reward_mode=judge log_path=/tmp/paint_rl/judge
+
+# In another shell per run: held-out evaluation of every checkpoint as it is saved
+python -m tinker_cookbook.recipes.paint_rl.eval_checkpoints log_path=/tmp/paint_rl/verifier
+python -m tinker_cookbook.recipes.paint_rl.eval_checkpoints log_path=/tmp/paint_rl/judge
+
+# Look at the results
+python -m tinker_cookbook.recipes.paint_rl.gallery artifact_dir=/tmp/paint_rl/verifier/paintings
+python -m tinker_cookbook.recipes.paint_rl.progression \
+    artifact_dir=/tmp/paint_rl/verifier/paintings out_dir=/tmp/paint_rl/verifier/progression
+python -m tinker_cookbook.recipes.paint_rl.compare_runs \
+    runs='{"verifier": "/tmp/paint_rl/verifier", "judge": "/tmp/paint_rl/judge"}' out=compare.png
+```
+
+Defaults: 8 prompts x 5 rollouts per step, 200 steps, LoRA rank 32, learning
+rate 4e-5. A checkpoint is saved every 10 steps and kept on Tinker indefinitely
+(`checkpoint_ttl_seconds=None`; the cookbook default would expire periodic
+checkpoints after 7 days); they are listed in `<log_path>/checkpoints.jsonl`.
+`hyperparam_utils.get_lr` has no calibrated value for Inkling; 4e-5 worked
+for the run in the top-level README, but sweep the learning rate and
+the effort settings (`policy_effort`, `verifier.effort`, `judge.effort`) if
+you change the model. Run-level knobs are in `train.py`; the reward-model and
+evaluator defaults live once, in `verifier.py`'s `VerifierConfig`,
+`JudgeConfig` and `EvaluatorConfig`, and are overridden with dotted names
+(`verifier.n_evaluations=2`, `judge.max_concurrency=256`,
+`evaluator.model_name=...`).
+
+Throughput: the whole step is in flight at once. A verifier step is 8 groups
+x 10 pairs x 3 criteria x 2 repeats = 480 calls, and the reward model's
+concurrency (`verifier.max_concurrency`, `judge.max_concurrency`, default
+1200) covers all of them with room to spare; rendering runs one step's 40 sketches at once
+(`render_concurrency=40`, about 4 pages per headless browser); policy
+sampling on Tinker is never throttled.
+
+## The loop
+
+1. **Prompt.** For example, `Paint a teal field of flowers on a rolling
+   hillside in wet-on-wet watercolor wash.` Most of the pool (`prompts.py`)
+   is subject x color x style: 43 subjects (flowers, still-life objects,
+   scenes and two animals) in three difficulty tiers (a single subject, a
+   subject in a setting, two elements in a spatial relation), 8 colors and 4
+   styles that stay visually distinct at 448 px. Eight fully worded skill
+   prompts test object counting, spatial relationships, shape and
+   perspective (`Paint a blue vase to the left of a yellow teacup, in
+   layered watercolor glazes.`); they name their own colors, so they are
+   crossed with the styles only and make up about a tenth of training. The
+   256 training prompts are balanced over subjects, colors and styles. The 50
+   held-out prompts are spread over every subject and are never trained on. `prompts_test.py` pins the split. The system prompt allows a fixed list of
+   about 20 brush calls and gives no API documentation; the original project
+   found that a long API reference made the model call functions that don't
+   exist.
+2. **Sketch.** The policy replies with one `javascript` block that defines
+   `setup()` on a 512x512 WEBGL canvas. The page renders one frame and stops
+   the loop itself.
+3. **Render.** `render.py` runs the sketch in a sandboxed headless Chromium
+   (Playwright with SwiftShader WebGL), with p5 1.11.3 and p5.brush 1.1.4
+   inlined, and reads the canvas back as a PNG. A sketch passes the compile
+   gate if it throws no error, makes at least three distinct `brush.*`
+   drawing calls, and paints a non-blank canvas.
+4. **Score.** With the **verifier**, every unordered pair of the group's
+   compiled paintings is compared once per criterion and repeat. A group of 5
+   gives 10 pairs x 3 criteria x 2 repeats = 60 comparisons, and a
+   painting's score is its mean grade across every comparison it appears in.
+   With the **judge**, each compiled painting gets one integer score 1-10,
+   mapped to `(s - 1) / 9`; paintings with equal scores get equal rewards, and
+   so equal advantages. Either way, sketches that fail the compile gate score
+   0 and are not scored.
+5. **Update.** `reward = 0.05 * compiled + 0.05 * length_ok + 0.90 * score`.
+   The reward is centered within each group and fed to an importance-sampling
+   policy gradient (`tinker_cookbook/rl/train.py`).
+
+Every rollout's JavaScript, PNG and raw response, plus every verifier score,
+are saved under
+`<log_path>/paintings/<split>/step_XXXX/<prompt id>/` and indexed in
+`paintings/index.jsonl`.
+
+## The reward is a distribution, not a letter
+
+`llm_verifier.compare` reads the verifier's top 20 alternatives at the token
+after each `<score_A>` and `<score_B>` tag, and the score is the
+*expectation* of the grade under that distribution, not the letter that
+happened to be sampled. A painting the verifier is torn on between "E" and
+"G" scores between them, and a 5% chance of "A" still raises the reward.
+Fine-grained scores like these are the reason the scale has 20 levels.
+
+The verifier is called through Tinker's
+[OpenAI-compatible endpoint](https://tinker-docs.thinkingmachines.ai/tinker/compatible-apis/openai/),
+which returns token logprobs but has no assistant prefill. `verifier.py`
+therefore sets the client up for `llm_verifier`'s hosted-API path, which
+reads the distribution from the score tags the model samples itself, rather
+than its prefill path, which would score every comparison as a tie on this
+endpoint.
+
+With the default two repeats per criterion, the second repeat swaps the two
+image slots, so each pair is judged once in each order and the verifier's
+bias toward one position cancels out within each pair. The three criteria are scored separately: prompt adherence,
+watercolor technique, and composition.
+
+## Verifier vs judge: ties
+
+An integer 1-10 judge often gives the best paintings in a group the same
+score; tied paintings get the same advantage, so the update carries no signal
+between them. `scorer/top_tie` is the fraction of groups (with at least two
+compiled paintings) whose highest score is shared by more than one painting.
+It is logged in both modes; the verifier's expected-grade scores rarely tie,
+so the two runs' `env/all/scorer/top_tie` curves show how much of that signal
+the judge loses.
+
+## Held-out evaluation
+
+Held-out evaluation runs in its own process, so it never blocks training and
+training stays on-policy. A checkpoint is saved every 10 steps (kept on Tinker
+indefinitely); `eval_checkpoints.py` follows `checkpoints.jsonl` and
+evaluates the base model and each checkpoint on the 50 held-out prompts:
+the policy samples 5 paintings per prompt, and Kimi-K2.6 scores them
+(`eval_strong/score`). The evaluator is set in `eval_checkpoints.py`
+(`evaluator.*`), not taken from the run, so verifier and judge runs are
+measured on the same yardstick. The run's own reward model is skipped there
+unless `with_reward=True`. Results go to `<log_path>/heldout_eval/`; already
+evaluated steps are skipped, so the evaluator can be restarted. `eval_every`
+in `train.py` (default 0) still runs the same evaluation inline if you prefer.
+
+Kimi's scores never enter the reward. The verifier's reward is relative to
+the other paintings in a group, and the judge's is on its own scale, so
+neither can be compared across steps or runs; the Kimi score is the fixed
+yardstick. Kimi is asked exactly what the judge is asked: one overall score
+per painting, an integer 1-10 read from its reply and mapped to `(s - 1) / 9`,
+in one call per painting (`evaluator.criteria=()` scores the three verifier
+criteria in separate calls instead). Kimi
+runs on Tinker's native sampler through the cookbook's `kimi_k26` renderer,
+because Tinker's OpenAI-compatible endpoint takes no images for it. A call
+that fails after the SDK's retries is left out (`eval_strong/failed_frac`).
+Another vision model on Tinker can be swapped in with
+`evaluator.model_name=...` (and `evaluator.renderer_name=...` if `model_info`
+has no renderer for it).
+
+Useful metrics in `metrics.jsonl`:
+
+- `env/all/reward/compile_ok`: compile gate pass rate.
+- `env/all/reward/score_if_compiled`: reward-model score of compiled paintings.
+- `env/all/scorer/top_tie`: fraction of groups whose top score is tied.
+- `env/all/scorer/failed_frac`: reward-model calls that failed, ran out of tokens or gave no parseable score (scored as 0.5); should stay near 0.
+- `test/env/all/eval_strong/score` (in `heldout_eval/metrics.jsonl`): Kimi's held-out score, the headline number.
+- `test/env/tier3/...`, `test/env/skill/...`: held-out metrics broken out by tier and by subject family (`flower`, `object`, `scene`, `animal`, `skill`).
+
+## Results
+
+An earlier version of the recipe (a different prompt pool, 8 x 5 per step,
+held-out prompts scored by Gemini) raised the held-out score from 3.24 to
+5.35 out of 10 by step 470 and the held-out compile rate from 76% to 100%.
+Those numbers are not comparable with the current defaults. Curves, example paintings and that run's metrics are in the
+[top-level README](https://github.com/jackyk02/paint_tinker#results).
+
+## Rendering on Modal
+
+`render_backend=modal` sends each page to a Modal function instead of a local
+browser (`render_modal.py`), for machines without Chromium. Deploy it once with
+`modal deploy tinker_cookbook/recipes/paint_rl/render_modal.py`. On a machine
+with many cores, local rendering is faster.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `prompts.py` | System prompt (brush allowlist), prompt pool, and the pinned held-out split |
+| `assets.py` | Pinned p5 / p5.brush sources, cached under `~/.cache/tinker-cookbook/paint_rl` |
+| `render.py` | Headless WebGL renderer and the compile / brush-use / blank gates |
+| `render_modal.py` | Optional Modal backend for the renderer |
+| `verifier.py` | `PairwiseVerifier` (round-robin tournament over `llm_verifier.compare`), the `AbsoluteJudge` baseline, the held-out Kimi `HeldoutEvaluator`, and their configs |
+| `env.py` | `PaintEnv`, group reward, held-out evaluation, artifact saving, dataset builder |
+| `train.py` | CLI launcher |
+| `eval_checkpoints.py` | Held-out evaluation of saved checkpoints, in a separate process |
+| `gallery.py`, `progression.py`, `compare_runs.py` | HTML gallery, per-step best-painting sheets, run comparison curves |

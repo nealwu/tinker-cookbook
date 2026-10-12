@@ -58,6 +58,11 @@ modal = [
 multiplayer-rl = [
     "textarena>=0.7.4",
 ]
+paint-rl = [
+    "llm-verifier>=0.2.0",
+    "openai>=1.0.0",
+    "playwright>=1.40.0",
+]
 tutorials = [
     "marimo>=0.23.8",
     "matplotlib>=3.7.0",
@@ -136,6 +141,7 @@ all = [
     "tinker_cookbook[math-rl]",
     "tinker_cookbook[modal]",
     "tinker_cookbook[multiplayer-rl]",
+    "tinker_cookbook[paint-rl]",
     "tinker_cookbook[vector-search]",
     "tinker_cookbook[wandb]",
     "tinker_cookbook[neptune-scale]",

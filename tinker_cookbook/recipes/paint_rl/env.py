@@ -523,6 +523,8 @@ class PaintRLDatasetBuilder(RLDatasetBuilder):
     test_group_size: int
     seed: int
     artifact_dir: str | None = None
+    # False trains on the subject prompts only; held-out prompts are unchanged.
+    train_skill_prompts: bool = True
 
     @property
     def reward_config(self) -> RewardConfig:
@@ -534,6 +536,7 @@ class PaintRLDatasetBuilder(RLDatasetBuilder):
             n_train=self.n_train_prompts,
             n_test=self.n_test_prompts,
             seed=self.seed,
+            train_skill_prompts=self.train_skill_prompts,
         )
         logger.info(
             "Prompt split: train %s | test %s",

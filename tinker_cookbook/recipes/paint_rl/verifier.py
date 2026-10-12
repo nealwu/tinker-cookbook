@@ -354,9 +354,11 @@ def make_tinker_openai_client(base_url: str | None, max_concurrency: int) -> Any
         base_url=base_url or TINKER_OPENAI_BASE_URL,
         api_key=key,
         max_retries=5,
-        # A call takes 5-60 s; the occasional request that hangs on the
-        # endpoint is retried after 5 min instead of stalling the step.
-        timeout=300.0,
+        # A call takes 5-60 s when the endpoint is idle but queues for minutes
+        # under load. Don't time those out: a re-sent call joins the back of the
+        # same queue, which grows it until whole steps hit the grading cap. This
+        # only catches a dead connection, with one retry still inside the cap.
+        timeout=1800.0,
         # The default pool (1000 connections) would queue part of a step.
         http_client=DefaultHttpxClient(
             limits=httpx.Limits(

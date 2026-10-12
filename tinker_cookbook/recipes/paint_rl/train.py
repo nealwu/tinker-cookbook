@@ -37,6 +37,8 @@ from tinker_cookbook.recipes.paint_rl.verifier import (
     RewardMode,
     VerifierConfig,
 )
+from tinker_cookbook.rl.rollout_limits import TerminationRewardPolicy
+from tinker_cookbook.rl.rollout_presets import default_rollout_config_for_model
 from tinker_cookbook.rl.train import AsyncConfig, Config, main
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,9 @@ class CLIConfig:
     # prompts are a sample of the pool spread over every subject.
     n_train_prompts: int = N_TRAIN_PROMPTS
     n_test_prompts: int = N_TEST_PROMPTS
+    # False leaves the skill prompts out of training (held-out is unchanged),
+    # to measure what they add.
+    train_skill_prompts: bool = True
     test_group_size: int = 5
     canvas_size: int = 512
     # Sketches rendered at once: one step's 40 rollouts, ~4 pages per browser.
@@ -114,8 +119,20 @@ class CLIConfig:
     checkpoint_ttl_seconds: int | None = None
     compute_post_kl: bool = False
     remove_constant_reward_groups: bool = False
+    # Cap on scoring one group. A pairwise step queues ~480 reward-model calls,
+    # which can take far longer than the 900 s Inkling preset allows when the
+    # endpoint is busy; a group that hits the cap is dropped from the step.
+    grader_timeout_s: float = 3600.0
     behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
     base_url: str | None = None
+
+
+def _termination_policy(cli: CLIConfig) -> TerminationRewardPolicy:
+    """The model's default termination policy with this recipe's grading cap."""
+    default = default_rollout_config_for_model(cli.model_name).termination
+    if default is None:
+        return TerminationRewardPolicy(grader_timeout_seconds=cli.grader_timeout_s)
+    return chz.replace(default, grader_timeout_seconds=cli.grader_timeout_s)
 
 
 async def cli_main(cli: CLIConfig) -> None:
@@ -151,6 +168,7 @@ async def cli_main(cli: CLIConfig) -> None:
         render_backend=cli.render_backend,
         n_train_prompts=cli.n_train_prompts,
         n_test_prompts=cli.n_test_prompts,
+        train_skill_prompts=cli.train_skill_prompts,
         test_group_size=cli.test_group_size,
         seed=cli.seed,
         artifact_dir=artifact_dir,
@@ -186,6 +204,7 @@ async def cli_main(cli: CLIConfig) -> None:
         # A prompt whose whole group scores the same teaches nothing once the
         # advantages are centered; drop it instead of paying for the backward pass.
         remove_constant_reward_groups=cli.remove_constant_reward_groups,
+        termination=_termination_policy(cli),
     )
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli.behavior_if_log_dir_exists)
     logger.info("Paintings and sketches will be saved under %s", artifact_dir)

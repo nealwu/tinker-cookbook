@@ -322,13 +322,15 @@ def build_prompt_splits(
     n_train: int = N_TRAIN_PROMPTS,
     n_test: int = N_TEST_PROMPTS,
     seed: int = 0,
+    train_skill_prompts: bool = True,
 ) -> tuple[list[PaintPrompt], list[PaintPrompt]]:
     """(train, test) prompt lists.
 
     * test: spread over subjects (then colors, styles and tiers), so every
       subject is evaluated; no subject is held out of training.
     * train: balanced over subjects, colors and styles, never one of the
-      exact test prompts.
+      exact test prompts. ``train_skill_prompts=False`` keeps the skill
+      prompts out of training only; the test split does not change.
     """
     rng = random.Random(seed)
     pool = build_prompt_pool()
@@ -340,9 +342,12 @@ def build_prompt_splits(
         )
     ]
     held = {p.id for p in test}
-    train = _stratified_pick(
-        [p for p in pool if p.id not in held], n_train, lambda p: p.subject, rng, balance=by_look
-    )
+    train_pool = [
+        p
+        for p in pool
+        if p.id not in held and (train_skill_prompts or p.family != "skill")
+    ]
+    train = _stratified_pick(train_pool, n_train, lambda p: p.subject, rng, balance=by_look)
     return train, test
 
 

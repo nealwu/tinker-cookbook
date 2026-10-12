@@ -1,4 +1,4 @@
-"""Multimodal LLM-as-a-Verifier reward, and the held-out Gemini evaluator.
+"""Multimodal LLM-as-a-Verifier reward, and the held-out evaluator.
 
 The policy writes code; the *reward* comes from a multimodal model that looks
 at the rendered paintings.
@@ -22,10 +22,11 @@ at the rendered paintings.
   read the letter distribution from the model's own sampled score tags (the
   ``llm_verifier`` path for hosted APIs) rather than by prefilling each tag.
 
-* :class:`GeminiEvaluator` — the held-out yardstick: ``gemini-3.8-flash``
-  scores each held-out painting on its own, 0-10 per criterion. It never
-  trains anything; it gives every checkpoint a score on one fixed scale that
-  is independent of the training reward.
+* :class:`TinkerEvaluator` — the held-out yardstick: a stronger vision model
+  on Tinker (``moonshotai/Kimi-K2.6`` by default) scores each held-out
+  painting on its own, 0-10 per criterion. It never trains anything; it gives
+  every checkpoint a score on one fixed scale that is independent of the
+  training reward.
 """
 
 from __future__ import annotations
@@ -37,23 +38,39 @@ import os
 import random
 import re
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from itertools import combinations
-from typing import Any
+from typing import Any, Literal
 
 import chz
+import tinker
 from PIL import Image
+
+from tinker_cookbook import model_info
+from tinker_cookbook.image_processing_utils import get_image_processor
+from tinker_cookbook.renderers import (
+    ImagePart,
+    Message,
+    Renderer,
+    TextPart,
+    get_renderer,
+    get_text_content,
+)
+from tinker_cookbook.tokenizer_utils import get_tokenizer
+from tinker_cookbook.utils.git_rev import recipe_user_metadata
 
 try:
     import llm_verifier
+    from llm_verifier import fine_grained_reward as llm_verifier_fgr
 except ImportError as e:  # pragma: no cover - environment specific
     raise ImportError("paint_rl needs the llm-verifier package: pip install llm-verifier") from e
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_VERIFIER_MODEL = "thinkingmachines/Inkling-Small"
-DEFAULT_EVALUATOR_MODEL = "gemini-3.8-flash"
+DEFAULT_EVALUATOR_MODEL = "moonshotai/Kimi-K2.6"
 TINKER_OPENAI_BASE_URL = "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
 
 # Tinker's named reasoning-effort presets (the OpenAI-compatible endpoint
@@ -115,6 +132,15 @@ PAIRWISE_NOTE = (
 SLOT_A = "Painting A: the FIRST attached image."
 SLOT_B = "Painting B: the SECOND attached image."
 
+# The same for the absolute-grading ablation, which shows one painting per call.
+ABSOLUTE_NOTE = (
+    "The candidate is a watercolor painting made by code for the painting "
+    "request in the task, attached as an image. A letter grade of A means "
+    "outstanding on the criterion and T means a complete failure, e.g. a blank "
+    "canvas or pure noise. " + GROUND_TRUTH_NOTE
+)
+SLOT_SINGLE = "Painting A: the attached image."
+
 
 def resolve_criteria(names: tuple[str, ...]) -> list[tuple[str, str]]:
     """``(name, description)`` for ``names`` (keys of DEFAULT_CRITERIA); empty = all."""
@@ -143,19 +169,34 @@ class VerifierConfig:
     image_size: int = 448
     max_concurrency: int = 480
     base_url: str | None = None
+    # Ablations of the reward. "absolute" grades each painting on its own with
+    # the same prompt framing, scale and score reading as a pairwise call (one
+    # painting instead of two; repeats are plain repeats). "judge" is the
+    # LLM-as-a-Judge baseline: each painting on its own, an integer 0-10 per
+    # criterion read from the reply (the held-out evaluator's prompt), same
+    # model, endpoint and effort. "letter" reads the sampled grade instead of its
+    # expectation under the token distribution (pairwise and absolute only).
+    mode: Literal["pairwise", "absolute", "judge"] = "pairwise"
+    score_from: Literal["expectation", "letter"] = "expectation"
 
 
 @chz.chz
 class EvaluatorConfig:
-    """The held-out evaluator (Gemini), which never enters the reward."""
+    """The held-out evaluator, a vision model on Tinker that never enters the reward."""
 
     model_name: str = DEFAULT_EVALUATOR_MODEL
+    # Default: the model's recommended renderer (thinking on, for Kimi-K2.6).
+    renderer_name: str | None = None
+    # Output budget, shared by the reasoning trace and the verdict.
     max_tokens: int = 8192
     temperature: float = 1.0
     n_evaluations: int = 1
     criteria: tuple[str, ...] = ()
     image_size: int = 448
-    max_concurrency: int = 50
+    # One checkpoint's held-out evaluation is 16 prompts x 5 paintings x 3
+    # criteria = 240 calls; this keeps all of them in flight.
+    max_concurrency: int = 256
+    base_url: str | None = None
 
 
 @dataclass
@@ -237,6 +278,35 @@ def _is_transient(error: Exception) -> bool:
     return False
 
 
+def absolute_prompt(problem: str, criterion: tuple[str, str]) -> str:
+    """Single-painting counterpart of ``llm_verifier``'s pairwise prompt.
+
+    Same framing, rating scale and ``<score_A>`` tag as the pairwise call, so
+    the absolute-grading ablation changes only how many paintings are shown.
+    """
+    name, description = criterion
+    scale = llm_verifier_fgr.SCALE
+    return (
+        "You are an expert evaluator of AI coding agents. "
+        "You will see a task description and one agent trajectory, then "
+        "evaluate it on ONE specific criterion, stated at the end.\n\n"
+        f"{ABSOLUTE_NOTE}\n\n"
+        f"**Task:**\n{problem}\n\n"
+        "**Attached images:** 1 image(s) are attached to this message, in order; "
+        "they are part of the task context.\n\n"
+        f"**Trajectory A:**\n{SLOT_SINGLE}\n\n"
+        f"**Rating Scale:**\n{scale['scale_description']}\n\n"
+        f"**Evaluation Guideline — {name}:**\n{description}\n\n"
+        f'Score the trajectory ONLY on this specific criterion ("{name}"). Ignore '
+        "other aspects of the trajectory that are not relevant to it.\n\n"
+        "Reason it through first, then END your reply with exactly this line and "
+        "nothing after it. Replace the placeholder with a single letter A-T, "
+        "keeping the spaces around the letter exactly as shown:\n"
+        f"<score_A> {scale['score_format']} </score_A>\n\n"
+        "Begin your analysis now."
+    )
+
+
 def make_tinker_verifier_client(config: VerifierConfig) -> Any:
     """An ``openai`` client on Tinker's OpenAI-compatible endpoint, set up for llm_verifier.
 
@@ -256,9 +326,11 @@ def make_tinker_verifier_client(config: VerifierConfig) -> Any:
         base_url=config.base_url or TINKER_OPENAI_BASE_URL,
         api_key=key,
         max_retries=5,
-        # A comparison takes 5-16 s; the occasional request that hangs on the
-        # endpoint is retried after 2 min instead of stalling the step for 10.
-        timeout=120.0,
+        # No short client-side timeout: under load the endpoint is slow but still
+        # progressing, and timing a request out only re-sends it, which adds load
+        # and makes every later call slower. The bound only catches a truly hung
+        # connection; the group-scoring cap (grader_timeout_s) bounds the step.
+        timeout=1800.0,
     )
     client._llm_verifier_model = config.model_name  # pyright: ignore[reportAttributeAccessIssue]
     client._llm_verifier_deepseek = True  # pyright: ignore[reportAttributeAccessIssue]
@@ -266,7 +338,11 @@ def make_tinker_verifier_client(config: VerifierConfig) -> Any:
 
 
 class PairwiseVerifier:
-    """LLM-as-a-Verifier reward for a group of paintings (round-robin tournament)."""
+    """LLM-as-a-Verifier reward for a group of paintings (round-robin tournament).
+
+    With ``mode="absolute"`` it grades each painting on its own instead (an
+    ablation of the pairwise reward).
+    """
 
     def __init__(self, config: VerifierConfig):
         self.config = config
@@ -277,23 +353,13 @@ class PairwiseVerifier:
             max_workers=config.max_concurrency, thread_name_prefix="paint-verifier"
         )
 
-    def _compare_sync(
-        self, problem: str, image_a: bytes, image_b: bytes, criterion: tuple[str, str]
-    ) -> tuple[float, float, bool]:
-        name, description = criterion
+    def _with_retries(
+        self, call: Callable[[], list[float]], n_scores: int
+    ) -> tuple[list[float], bool]:
+        """Run one verifier call; returns (scores, failed)."""
         for attempt, delay in enumerate((*RETRY_DELAYS_S, None)):
             try:
-                ra, rb = llm_verifier.compare(
-                    problem,
-                    SLOT_A,
-                    SLOT_B,
-                    criteria={name: description},
-                    images=[image_a, image_b],
-                    ground_truth_note=PAIRWISE_NOTE,
-                    model=self.config.model_name,
-                    client=self._client,
-                )
-                return ra, rb, False
+                return call(), False
             except Exception as e:
                 if delay is not None and _is_transient(e):
                     logger.info(
@@ -303,8 +369,85 @@ class PairwiseVerifier:
                     continue
                 # A call that still fails is a tie, as llm_verifier's on_error="tie".
                 logger.warning("verifier call failed (%s: %s); scoring a tie", type(e).__name__, e)
-                return 0.5, 0.5, True
+                return [0.5] * n_scores, True
         raise AssertionError("unreachable")
+
+    def _read_scores(self, prompt: str, images: list[bytes], tags: list[str]) -> list[float]:
+        """One verifier call through llm_verifier's internals, scored per ``score_from``."""
+        text, tokens, position_logprobs = llm_verifier_fgr.call_verifier(
+            self._client,
+            prompt,
+            self.config.model_name,
+            images=llm_verifier_fgr.as_image_list(images),
+        )
+        if self.config.score_from == "letter":
+            tokens, position_logprobs = None, None  # extract_score falls back to the letter
+        return [
+            llm_verifier_fgr.extract_score(text, tokens, position_logprobs, tag) for tag in tags
+        ]
+
+    def _compare_sync(
+        self, problem: str, image_a: bytes, image_b: bytes, criterion: tuple[str, str]
+    ) -> tuple[float, float, bool]:
+        name, description = criterion
+        if self.config.score_from == "expectation":
+
+            def call() -> list[float]:
+                return list(
+                    llm_verifier.compare(
+                        problem,
+                        SLOT_A,
+                        SLOT_B,
+                        criteria={name: description},
+                        images=[image_a, image_b],
+                        ground_truth_note=PAIRWISE_NOTE,
+                        model=self.config.model_name,
+                        client=self._client,
+                    )
+                )
+
+        else:
+            # What llm_verifier.compare does for one criterion, minus the logprobs.
+            prompt = llm_verifier_fgr.build_prompt(
+                problem,
+                SLOT_A,
+                SLOT_B,
+                {"name": name, "description": description},
+                PAIRWISE_NOTE,
+                n_images=2,
+            )
+
+            def call() -> list[float]:
+                return self._read_scores(prompt, [image_a, image_b], ["<score_A>", "<score_B>"])
+
+        (ra, rb), failed = self._with_retries(call, 2)
+        return ra, rb, failed
+
+    def _grade_sync(
+        self, problem: str, image: bytes, criterion: tuple[str, str]
+    ) -> tuple[float, bool]:
+        if self.config.mode == "judge":
+            prompt = evaluator_prompt(problem, criterion)
+
+            def call() -> list[float]:
+                text, _, _ = llm_verifier_fgr.call_verifier(
+                    self._client,
+                    prompt,
+                    self.config.model_name,
+                    images=llm_verifier_fgr.as_image_list([image]),
+                )
+                score = extract_score(text)
+                if score is None:
+                    raise ValueError("judge reply has no <score> tag")
+                return [score]
+
+            (r,), failed = self._with_retries(call, 1)
+            return r, failed
+        prompt = absolute_prompt(problem, criterion)
+        (r,), failed = self._with_retries(
+            lambda: self._read_scores(prompt, [image], ["<score_A>"]), 1
+        )
+        return r, failed
 
     async def compare(
         self, problem: str, image_a: bytes, image_b: bytes, criterion: tuple[str, str]
@@ -329,6 +472,8 @@ class PairwiseVerifier:
         n = len(images)
         if n == 0:
             return GroupScores(scores=[])
+        if self.config.mode in ("absolute", "judge"):
+            return await self._score_group_absolute(problem, images)
         if n == 1:
             return GroupScores(scores=[0.5])
         criteria = resolve_criteria(self.config.criteria)
@@ -371,9 +516,50 @@ class PairwiseVerifier:
             n_truncated=sum(v.truncated for v in verdicts),
         )
 
+    async def _score_group_absolute(self, problem: str, images: list[Image.Image]) -> GroupScores:
+        """Each painting graded on its own, for every criterion and repeat."""
+        criteria = resolve_criteria(self.config.criteria)
+        pngs = [_png_bytes(_fit(im, self.config.image_size)) for im in images]
+        loop = asyncio.get_running_loop()
+
+        async def run(i: int, crit: tuple[str, str], rep: int) -> Verdict:
+            r, failed = await loop.run_in_executor(
+                self._pool, self._grade_sync, problem, pngs[i], crit
+            )
+            return Verdict(
+                criterion=crit[0],
+                rep=rep,
+                slot_a=i,
+                slot_b=None,
+                score_a=r,
+                score_b=None,
+                text="",
+                truncated=failed,
+            )
+
+        verdicts = await asyncio.gather(
+            *(
+                run(i, crit, rep)
+                for i in range(len(images))
+                for crit in criteria
+                for rep in range(self.config.n_evaluations)
+            )
+        )
+        total = [0.0] * len(images)
+        count = [0] * len(images)
+        for v in verdicts:
+            total[v.slot_a] += v.score_a
+            count[v.slot_a] += 1
+        return GroupScores(
+            scores=[total[i] / count[i] if count[i] else 0.5 for i in range(len(images))],
+            verdicts=list(verdicts),
+            n_calls=len(verdicts),
+            n_truncated=sum(v.truncated for v in verdicts),
+        )
+
 
 # ---------------------------------------------------------------------------
-# Held-out evaluator: Gemini, one painting at a time, 0-10
+# Held-out evaluator: a vision model on Tinker, one painting at a time, 0-10
 # ---------------------------------------------------------------------------
 
 
@@ -383,64 +569,64 @@ class Reply:
     truncated: bool
 
 
-class _GeminiClient:
-    """Gemini via the google-genai async client."""
+class _TinkerEvaluatorClient:
+    """A vision model on Tinker, sampled through the cookbook renderer for that model."""
 
     def __init__(self, config: EvaluatorConfig):
         self.config = config
-        self._client: Any = None
+        self._renderer: Renderer | None = None
+        self._sampling_client: tinker.SamplingClient | None = None
         self._semaphore = asyncio.Semaphore(config.max_concurrency)
         self._lock = asyncio.Lock()
 
     async def _ensure_started(self) -> None:
         async with self._lock:
-            if self._client is not None:
+            if self._sampling_client is not None:
                 return
-            from google import genai
-
-            key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-            if not key:
-                raise llm_verifier.MissingAPIKeyError(
-                    f"set GEMINI_API_KEY to use {self.config.model_name!r} as the held-out "
-                    "evaluator, or pass eval_model=None to turn it off"
-                )
-            from google.genai.types import HttpOptions, HttpRetryOptions
-
-            # Gemini sheds load with 429 / 503 ("high demand"); retry those with
-            # exponential backoff instead of failing the evaluation.
-            retry = HttpRetryOptions(
-                attempts=8,
-                initial_delay=2.0,
-                max_delay=60.0,
-                http_status_codes=[408, 429, 500, 502, 503, 504],
+            name = self.config.model_name
+            if not model_info.get_model_attributes(name).is_vl:
+                raise ValueError(f"{name!r} does not accept image input; pick a vision model")
+            self._renderer = get_renderer(
+                self.config.renderer_name or model_info.get_recommended_renderer_name(name),
+                get_tokenizer(name),
+                get_image_processor(name),
+                model_name=name,
             )
-            self._client = genai.Client(api_key=key, http_options=HttpOptions(retry_options=retry))
+            service_client = tinker.ServiceClient(
+                base_url=self.config.base_url,
+                user_metadata=recipe_user_metadata("recipe_paint_rl_evaluator"),
+            )
+            self._sampling_client = await service_client.create_sampling_client_async(
+                base_model=name
+            )
 
     async def ask(self, prompt: str, image: Image.Image) -> Reply:
         await self._ensure_started()
-        from google.genai.types import Content, GenerateContentConfig, Part
-
-        parts = [Part(text=prompt), Part.from_bytes(data=_png_bytes(image), mime_type="image/png")]
+        assert self._renderer is not None and self._sampling_client is not None
+        messages = [
+            Message(
+                role="user",
+                content=[TextPart(type="text", text=prompt), ImagePart(type="image", image=image)],
+            )
+        ]
+        model_input = self._renderer.build_generation_prompt(messages)
         try:
             async with self._semaphore:
-                response = await self._client.aio.models.generate_content(
-                    model=self.config.model_name,
-                    contents=[Content(role="user", parts=parts)],
-                    config=GenerateContentConfig(
-                        max_output_tokens=self.config.max_tokens,
+                response = await self._sampling_client.sample_async(
+                    prompt=model_input,
+                    num_samples=1,
+                    sampling_params=tinker.SamplingParams(
+                        max_tokens=self.config.max_tokens,
                         temperature=self.config.temperature,
+                        stop=self._renderer.get_stop_sequences(),
                     ),
                 )
-        except Exception as e:  # still failing after the client's retries
-            logger.warning("Gemini call failed (%s: %s)", type(e).__name__, e)
+        except Exception as e:  # still failing after the SDK's own retries
+            logger.warning("evaluator call failed (%s: %s)", type(e).__name__, e)
             return Reply(text="", truncated=True)
-        text = response.text or ""
-        candidate = (response.candidates or [None])[0]
-        finish = getattr(candidate, "finish_reason", None)
-        return Reply(
-            text=text,
-            truncated=str(finish or "").upper().endswith("MAX_TOKENS") or not text,
-        )
+        message, termination = self._renderer.parse_response(response.sequences[0].tokens)
+        text = get_text_content(message)
+        return Reply(text=text, truncated=not termination.is_stop_sequence or not text)
 
 
 _EVALUATOR_PREAMBLE = (
@@ -476,12 +662,12 @@ def extract_score(text: str) -> float | None:
     return max(0.0, min(10.0, float(matches[-1]))) / 10.0
 
 
-class GeminiEvaluator:
+class TinkerEvaluator:
     """Independent absolute scores per painting, no pairing."""
 
     def __init__(self, config: EvaluatorConfig):
         self.config = config
-        self._client = _GeminiClient(config)
+        self._client = _TinkerEvaluatorClient(config)
 
     async def score_one(
         self, problem: str, image: Image.Image, criterion: tuple[str, str]
@@ -539,7 +725,7 @@ class GeminiEvaluator:
 
 
 _VERIFIERS: dict[VerifierConfig, PairwiseVerifier] = {}
-_EVALUATORS: dict[EvaluatorConfig, GeminiEvaluator] = {}
+_EVALUATORS: dict[EvaluatorConfig, TinkerEvaluator] = {}
 
 
 def get_shared_verifier(config: VerifierConfig) -> PairwiseVerifier:
@@ -549,8 +735,8 @@ def get_shared_verifier(config: VerifierConfig) -> PairwiseVerifier:
     return _VERIFIERS[config]
 
 
-def get_shared_evaluator(config: EvaluatorConfig) -> GeminiEvaluator:
+def get_shared_evaluator(config: EvaluatorConfig) -> TinkerEvaluator:
     """One evaluator per config per process."""
     if config not in _EVALUATORS:
-        _EVALUATORS[config] = GeminiEvaluator(config)
+        _EVALUATORS[config] = TinkerEvaluator(config)
     return _EVALUATORS[config]

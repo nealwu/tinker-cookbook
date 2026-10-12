@@ -5,10 +5,10 @@
 The policy is ``thinkingmachines/Inkling-Small`` on Tinker. It is rewarded by
 the pairwise, fine-grained LLM-as-a-Verifier round-robin tournament, run by
 Inkling-Small itself at low thinking effort. Held-out groups are additionally
-scored by ``gemini-3.8-flash``, which never feeds back into training.
+scored by ``moonshotai/Kimi-K2.6`` on Tinker, which never feeds back into
+training (``eval_model=None`` turns it off).
 
-Needs ``TINKER_API_KEY``, plus ``GEMINI_API_KEY`` for the held-out evaluator
-(``eval_model=None`` turns it off).
+Needs ``TINKER_API_KEY``.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import chz
 from tinker.types import LossFnType
@@ -30,6 +31,8 @@ from tinker_cookbook.recipes.paint_rl.verifier import (
     EvaluatorConfig,
     VerifierConfig,
 )
+from tinker_cookbook.rl.rollout_limits import TerminationRewardPolicy
+from tinker_cookbook.rl.rollout_presets import default_rollout_config_for_model
 from tinker_cookbook.rl.train import AsyncConfig, Config, main
 
 logger = logging.getLogger(__name__)
@@ -65,6 +68,11 @@ class CLIConfig:
     # falls back to a 0.5 tie, so the budget is cheap insurance.
     verifier_max_tokens: int = 8192
     verifier_n_evaluations: int = 2
+    # Reward ablations (see VerifierConfig): "absolute" grades each painting alone;
+    # "judge" scores each painting alone on an integer 0-10 scale (LLM-as-a-Judge);
+    # "letter" reads the sampled grade instead of its expectation.
+    verifier_mode: Literal["pairwise", "absolute", "judge"] = "pairwise"
+    verifier_score_from: Literal["expectation", "letter"] = "expectation"
     criteria: tuple[str, ...] = ()
     # Concurrent verifier calls. One step's tournament is 8 groups x 60 = 480
     # calls; measured on Tinker's endpoint, 480 in flight finished a step's worth
@@ -77,7 +85,7 @@ class CLIConfig:
     eval_model: str | None = DEFAULT_EVALUATOR_MODEL
     eval_max_tokens: int = 8192
     eval_n_evaluations: int = 1
-    eval_concurrency: int = 50
+    eval_concurrency: int = 256
 
     # Data / rendering
     # Training prompts are balanced over subjects, colours and styles. Held-out
@@ -87,6 +95,9 @@ class CLIConfig:
     test_group_size: int = 5
     canvas_size: int = 512
     render_concurrency: int = 16
+    # Software WebGL runs in one GPU process per browser, so pages in the same
+    # browser contend for it; on a many-core machine, more browsers render faster.
+    render_browsers: int = 4
     # Sketches grow longer over training (about 2x by step 150), and software
     # WebGL rendering of a long one can pass 2 min when the CPU is shared; a
     # timeout scores 0, so leave plenty of headroom.
@@ -112,6 +123,11 @@ class CLIConfig:
     checkpoint_ttl_seconds: int | None = None
     compute_post_kl: bool = False
     remove_constant_reward_groups: bool = False
+    # Wall-clock cap on scoring one group (rendering plus the verifier
+    # tournament); a group that exceeds it is dropped from the step. The
+    # cookbook's Inkling default (900 s) is too tight when the verifier
+    # endpoint is slow, so it is raised here.
+    grader_timeout_s: float = 3600.0
     behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
     base_url: str | None = None
 
@@ -123,6 +139,8 @@ def build_scorer_configs(cli: CLIConfig) -> tuple[VerifierConfig, EvaluatorConfi
         effort=cli.verifier_effort,
         max_tokens=cli.verifier_max_tokens,
         n_evaluations=cli.verifier_n_evaluations,
+        mode=cli.verifier_mode,
+        score_from=cli.verifier_score_from,
         criteria=cli.criteria,
         max_concurrency=cli.verifier_concurrency,
     )
@@ -133,11 +151,20 @@ def build_scorer_configs(cli: CLIConfig) -> tuple[VerifierConfig, EvaluatorConfi
             n_evaluations=cli.eval_n_evaluations,
             criteria=cli.criteria,
             max_concurrency=cli.eval_concurrency,
+            base_url=cli.base_url,
         )
         if cli.eval_model is not None
         else None
     )
     return verifier_config, evaluator_config
+
+
+def _termination_policy(cli: CLIConfig) -> TerminationRewardPolicy | None:
+    """The model's default termination policy with this recipe's grading cap."""
+    default = default_rollout_config_for_model(cli.model_name).termination
+    if default is None:
+        return TerminationRewardPolicy(grader_timeout_seconds=cli.grader_timeout_s)
+    return chz.replace(default, grader_timeout_seconds=cli.grader_timeout_s)
 
 
 async def cli_main(cli: CLIConfig) -> None:
@@ -168,6 +195,7 @@ async def cli_main(cli: CLIConfig) -> None:
         weights=cli.weights,
         canvas_size=cli.canvas_size,
         render_concurrency=cli.render_concurrency,
+        render_browsers=cli.render_browsers,
         render_timeout_s=cli.render_timeout_s,
         render_backend=cli.render_backend,
         n_train_prompts=cli.n_train_prompts,
@@ -207,6 +235,7 @@ async def cli_main(cli: CLIConfig) -> None:
         # A prompt whose whole group scores the same teaches nothing once the
         # advantages are centred; drop it instead of paying for the backward pass.
         remove_constant_reward_groups=cli.remove_constant_reward_groups,
+        termination=_termination_policy(cli),
     )
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli.behavior_if_log_dir_exists)
     logger.info("Paintings and sketches will be saved under %s", artifact_dir)

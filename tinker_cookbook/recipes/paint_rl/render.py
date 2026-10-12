@@ -300,6 +300,7 @@ def get_shared_renderer(
     max_concurrency: int = 16,
     backend: RenderBackend = "local",
     timeout_s: float = 120.0,
+    n_browsers: int = 4,
 ) -> SketchRenderer:
     """Process-wide renderer (one browser pool), created on first use."""
     global _SHARED
@@ -308,11 +309,13 @@ def get_shared_renderer(
         or _SHARED.canvas_size != canvas_size
         or _SHARED.backend != backend
         or _SHARED.timeout_s != timeout_s
+        or _SHARED.n_browsers != max(1, min(n_browsers, max_concurrency))
     ):
         _SHARED = SketchRenderer(
             canvas_size=canvas_size,
             max_concurrency=max_concurrency,
             backend=backend,
             timeout_s=timeout_s,
+            n_browsers=n_browsers,
         )
     return _SHARED

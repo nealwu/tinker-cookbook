@@ -22,21 +22,24 @@ at the two rendered paintings through its native image input.
 |---|---|---|
 | Policy | `thinkingmachines/Inkling-Small` | LoRA rank 32, `tml_v0` renderer, thinking effort 0.7, 8k token budget |
 | Training reward | `thinkingmachines/Inkling-Small` | `llm_verifier.compare` over Tinker's OpenAI-compatible endpoint, thinking effort 0.2, token logprobs, pairwise round-robin tournament |
-| Held-out evaluator | `gemini-3.8-flash` | Separate from the reward and never trained against |
+| Held-out evaluator | `moonshotai/Kimi-K2.6` | Sampled on Tinker; separate from the reward and never trained against |
 
 ## Running
 
 ```bash
-pip install -e ".[paint-rl]"     # llm-verifier, openai, google-genai, playwright
+pip install -e ".[paint-rl]"     # llm-verifier, openai, playwright
 python -m playwright install --with-deps chromium
 
 export TINKER_API_KEY=...
-export GEMINI_API_KEY=...   # held-out evaluator; or pass eval_model=None
 
 python -m tinker_cookbook.recipes.paint_rl.train log_path=/tmp/paint_rl/verifier
 
 # In a second shell: held-out evaluation of every checkpoint as it is saved
 python -m tinker_cookbook.recipes.paint_rl.eval_checkpoints log_path=/tmp/paint_rl/verifier
+
+# Score the same checkpoints with a different evaluator (writes heldout_eval_Inkling/)
+python -m tinker_cookbook.recipes.paint_rl.eval_checkpoints log_path=/tmp/paint_rl/verifier \
+    eval_model=thinkingmachines/Inkling
 
 # Look at the results
 python -m tinker_cookbook.recipes.paint_rl.gallery artifact_dir=/tmp/paint_rl/verifier/paintings
@@ -51,7 +54,7 @@ rate 4e-5. A checkpoint is saved every 5 steps and kept on Tinker indefinitely
 (`checkpoint_ttl_seconds=None`; the cookbook default would expire periodic
 checkpoints after 7 days); they are listed in `<log_path>/checkpoints.jsonl`.
 `hyperparam_utils.get_lr` has no calibrated value for Inkling; 4e-5 worked
-here (see the top-level README for the run), but sweep the learning rate and
+here (see Results), but sweep the learning rate and
 the two effort settings (`policy_effort`, `verifier_effort`) if you change
 the model. Every knob is in `train.py`.
 
@@ -120,34 +123,38 @@ Held-out evaluation runs in its own process, so it never blocks training and
 training stays on-policy. A checkpoint is saved every 5 steps (kept on Tinker
 indefinitely); `eval_checkpoints.py` follows `checkpoints.jsonl` and
 evaluates the base model and each checkpoint on the 16 held-out prompts:
-the policy samples 5 paintings per prompt, and Gemini scores them
+the policy samples 5 paintings per prompt, and the evaluator scores them
 (`eval_strong/score`). The training verifier is skipped there unless
 `with_verifier=True`. Results go to `<log_path>/heldout_eval/`; already
 evaluated steps are skipped, so the evaluator can be restarted. `eval_every`
 in `train.py` (default 0) still runs the same evaluation inline if you prefer.
 
-Gemini's scores never enter the reward. The verifier's reward is relative to
-the other paintings in a group, so it can't be compared across steps or runs;
-the Gemini score is the fixed yardstick. Gemini returns no logprobs, so it
-scores from the number it writes in its reply: an integer 0-10 per criterion,
-averaged over the three criteria and divided by 10. Calls that fail with 429/5xx are retried with backoff; a call that still
-fails is left out (`eval_strong/failed_frac`).
+The evaluator's scores never enter the reward. The verifier's reward is
+relative to the other paintings in a group, so it can't be compared across
+steps or runs; the evaluator score is the fixed yardstick. The evaluator is
+`moonshotai/Kimi-K2.6` by default: a different model family from the policy
+and verifier, sampled through the Tinker SDK with the cookbook's renderer for
+that model. Any vision model on Tinker works (`eval_model=...` in `train.py`
+or `eval_checkpoints.py`). It scores each painting on its own, from the
+number it writes in its reply: an integer 0-10 per criterion, averaged over
+the three criteria and divided by 10. A call that fails or never writes a
+score is left out (`eval_strong/failed_frac`).
 
 Useful metrics in `metrics.jsonl`:
 
 - `env/all/reward/compile_ok`: compile gate pass rate.
 - `env/all/reward/score_if_compiled`: verifier score of compiled paintings.
 - `env/all/verifier/failed_frac`: verifier calls that failed or ran out of tokens and were scored as ties; should stay near 0.
-- `test/env/all/eval_strong/score` (in `heldout_eval/metrics.jsonl`): Gemini's held-out score, the headline number.
+- `test/env/all/eval_strong/score` (in `heldout_eval/metrics.jsonl`): the evaluator's held-out score, the headline number.
 - `test/env/tier3/...`, `test/env/novel_subject/...`: held-out metrics broken out by tier and by held-out kind.
 
 ## Results
 
-With the defaults, the held-out Gemini score rose from 3.24 to 5.35 out of 10
-by step 470 (4.25 to 5.35 on compiled paintings only), and the held-out
-compile rate from 76% to 100%. Curves, example paintings and the run's
-metrics are in the
-[top-level README](https://github.com/jackyk02/paint_tinker#results).
+Results with `moonshotai/Kimi-K2.6` as the held-out evaluator are pending.
+In an earlier run with these training defaults, scored by Gemini 3.8 Flash
+instead, the held-out score rose from 3.24 to 5.35 out of 10 by step 470
+(4.25 to 5.35 on compiled paintings only), and the held-out compile rate from
+76% to 100%.
 
 ## Rendering on Modal
 
@@ -164,7 +171,7 @@ with many cores, local rendering is faster.
 | `assets.py` | Pinned p5 / p5.brush sources, cached under `~/.cache/tinker-cookbook/paint_rl` |
 | `render.py` | Headless WebGL renderer and the compile / brush-use / blank gates |
 | `render_modal.py` | Optional Modal backend for the renderer |
-| `verifier.py` | `PairwiseVerifier` (round-robin tournament over `llm_verifier.compare`) and the held-out `GeminiEvaluator` |
+| `verifier.py` | `PairwiseVerifier` (round-robin tournament over `llm_verifier.compare`) and the held-out `TinkerEvaluator` |
 | `env.py` | `PaintEnv`, group reward, held-out evaluation, artifact saving, dataset builder |
 | `train.py` | CLI launcher |
 | `eval_checkpoints.py` | Held-out evaluation of saved checkpoints, in a separate process |

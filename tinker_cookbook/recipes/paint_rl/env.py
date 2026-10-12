@@ -11,8 +11,9 @@ Reward for one rollout (all terms in [0, 1]):
   rollouts that failed the compile gate (they are excluded from the
   tournament).
 
-Held-out groups are additionally scored by an independent strong evaluator
-(``gemini-3.8-flash``) that never feeds back into training; it reports
+Held-out groups are additionally scored by an independent, stronger evaluator
+(``moonshotai/Kimi-K2.6`` on Tinker by default) that never feeds back into
+training; it reports
 ``eval_strong/score``, a measure of quality that does not depend on the
 training reward.
 
@@ -156,7 +157,7 @@ class RolloutRecord:
     reward: float
     score: float
     eval_score: float | None
-    """Held-out evaluator (Gemini) score; None on the train split or when off."""
+    """Held-out evaluator score; None on the train split or when off."""
     compiled: bool
     length_ok: bool
     truncated: bool
@@ -191,6 +192,8 @@ class PaintEnvGroupBuilder(EnvGroupBuilder):
     iteration: int
     seed: int = 0
     render_concurrency: int = 16
+    # Headless browsers the render_concurrency pages are spread over.
+    render_browsers: int = 4
     render_backend: RenderBackend = "local"
     # Per-sketch render timeout. A sketch that times out fails the compile gate.
     render_timeout_s: float = 300.0
@@ -225,7 +228,11 @@ class PaintEnvGroupBuilder(EnvGroupBuilder):
         envs = [e for e in env_group if isinstance(e, PaintEnv)]
         assert len(envs) == len(trajectory_group)
         renderer = get_shared_renderer(
-            self.canvas_size, self.render_concurrency, self.render_backend, self.render_timeout_s
+            self.canvas_size,
+            self.render_concurrency,
+            self.render_backend,
+            self.render_timeout_s,
+            n_browsers=self.render_browsers,
         )
 
         # 1) render every sketch (compile gate)
@@ -409,7 +416,7 @@ class PaintEnvGroupBuilder(EnvGroupBuilder):
                 img = _image_html(render.png) if render.png is not None else "<i>(no image)</i>"
                 caption = (
                     f"#{rec.index} reward={rec.reward:.3f} score={rec.score:.3f} "
-                    + (f"gemini={rec.eval_score:.2f} " if rec.eval_score is not None else "")
+                    + (f"eval={rec.eval_score:.2f} " if rec.eval_score is not None else "")
                     + f"chars={rec.code_chars}"
                     + (
                         f"<br/><span style='color:#b00'>{html.escape(rec.render_error)}</span>"
@@ -516,6 +523,7 @@ class PaintRLDatasetBuilder(RLDatasetBuilder):
     weights: RewardWeights = chz.field(default_factory=RewardWeights)
     canvas_size: int = 512
     render_concurrency: int = 16
+    render_browsers: int = 4
     render_backend: RenderBackend = "local"
     render_timeout_s: float = 300.0
     n_train_prompts: int = 256
@@ -580,6 +588,7 @@ class PaintRLDatasetBuilder(RLDatasetBuilder):
                     iteration=iteration,
                     seed=self.seed,
                     render_concurrency=self.render_concurrency,
+                    render_browsers=self.render_browsers,
                     render_backend=self.render_backend,
                     render_timeout_s=self.render_timeout_s,
                 )

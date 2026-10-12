@@ -12,7 +12,7 @@ Training saves sampler weights every ``save_every`` steps and lists them in
 0) and then each listed checkpoint whose step is a multiple of ``every``, plus
 the final one, on the run's held-out prompts: the policy samples
 ``test_group_size`` paintings per prompt, they are rendered, and the held-out
-evaluator (Gemini) scores them. The training verifier is skipped unless
+evaluator scores them. The training verifier is skipped unless
 ``with_verifier=True``. Training is never blocked, stays on-policy, and a
 crashed or lagging evaluation can be re-run later on any checkpoint.
 
@@ -68,13 +68,18 @@ class Config:
     with_verifier: bool = False
     # Default: <log_path>/heldout_eval
     out_dir: str | None = None
+    # Score with this evaluator model instead of the one in the run's config, e.g.
+    # thinkingmachines/Inkling to compare evaluators on the same checkpoints.
+    # Default out_dir then becomes <log_path>/heldout_eval_<model>.
+    eval_model: str | None = None
     # Concurrent calls to the held-out evaluator. Policy sampling on Tinker is
     # not throttled: all held-out rollouts are submitted at once.
-    eval_concurrency: int = 50
+    eval_concurrency: int = 256
     # Rendering here is not time-critical and shares the CPU with training:
     # few pages at once and a long timeout, so a slow render is never scored
     # as a failed sketch.
     render_concurrency: int = 4
+    render_browsers: int = 4
     render_timeout_s: float = 600.0
     base_url: str | None = None
 
@@ -127,7 +132,10 @@ class HeldoutEvaluator:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.log_path = Path(cfg.log_path)
-        self.out_dir = Path(cfg.out_dir or self.log_path / "heldout_eval")
+        default_out = "heldout_eval"
+        if cfg.eval_model is not None:
+            default_out += "_" + cfg.eval_model.split("/")[-1].replace(":", "_")
+        self.out_dir = Path(cfg.out_dir or self.log_path / default_out)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         run = json.loads((self.log_path / "config.json").read_text())
 
@@ -146,11 +154,21 @@ class HeldoutEvaluator:
         # Runs logged before the rename used judge_config / eval_judge_config.
         verifier_raw = data.get("verifier_config") or data["judge_config"]
         evaluator_raw = data.get("evaluator_config") or data.get("eval_judge_config")
-        if not evaluator_raw:
-            raise ValueError("this run has no held-out evaluator configured (eval_model=None)")
+        if not evaluator_raw and cfg.eval_model is None:
+            raise ValueError(
+                "this run has no held-out evaluator configured (eval_model=None); "
+                "pass eval_model=... to choose one"
+            )
+        overrides: dict[str, Any] = {
+            "max_concurrency": cfg.eval_concurrency,
+            "base_url": cfg.base_url,
+        }
+        if cfg.eval_model is not None:
+            # The run's renderer choice belonged to its own evaluator model.
+            overrides.update(model_name=cfg.eval_model, renderer_name=None)
         self.verifier_config: VerifierConfig = _rebuild(VerifierConfig, verifier_raw)
         self.evaluator_config: EvaluatorConfig = _rebuild(
-            EvaluatorConfig, evaluator_raw, max_concurrency=cfg.eval_concurrency
+            EvaluatorConfig, evaluator_raw or {}, **overrides
         )
         self.weights = RewardWeights(**data["weights"])
         self.service = tinker.ServiceClient(
@@ -176,6 +194,7 @@ class HeldoutEvaluator:
                 iteration=iteration,
                 seed=self.data["seed"],
                 render_concurrency=self.cfg.render_concurrency,
+                render_browsers=self.cfg.render_browsers,
                 render_timeout_s=self.cfg.render_timeout_s,
                 render_backend=self.data["render_backend"],
                 score_with_training_reward=self.cfg.with_verifier,
@@ -223,6 +242,7 @@ class HeldoutEvaluator:
                 self.cfg.render_concurrency,
                 self.data["render_backend"],
                 self.cfg.render_timeout_s,
+                n_browsers=self.cfg.render_browsers,
             ).close()
 
     async def _run(self) -> None:

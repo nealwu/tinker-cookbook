@@ -7,7 +7,7 @@
 Prints a per-run summary table and writes a figure with the training curves
 of the compile-gate pass rate, verifier score of compiled paintings, total
 reward, and code length. Runs with different verifier settings optimise
-different rewards; compare those on the held-out Gemini score instead.
+different rewards; compare those on the held-out evaluator score instead.
 """
 
 from __future__ import annotations

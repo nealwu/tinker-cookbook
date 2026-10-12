@@ -43,7 +43,6 @@ Write ONE complete JavaScript sketch that paints the requested subject. Reply wi
 Hard rules:
 - Define `function setup()` only. No draw() loop, no async code, no images, fonts, fetch, DOM, or external files.
 - setup() must start with exactly: createCanvas({size}, {size}, WEBGL); angleMode(DEGREES); background(<paper colour>); brush.load();
-- setup() must end with noLoop();
 - WEBGL coordinates: (0, 0) is the CENTRE of the canvas. x and y run from -{half} to {half}; y grows downwards.
 - Use ONLY these brush functions (any other brush.* call throws and the painting is lost):
     brush.pick(name)                 name in "2B","HB","2H","cpencil","pen","rotring","spray","marker","marker2","charcoal"

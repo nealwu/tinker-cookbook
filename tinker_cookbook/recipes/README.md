@@ -32,6 +32,7 @@ We provide the following examples:
 - **[Model distillation](./distillation/)**: use on-policy distillation or SFT to distill intelligence from a teacher model.
 - **[Rubric-based grading](./rubric/)**: use an LLM grader with rubrics to provide rewards for RL training.
 - **[Verifiers environments](./verifiers_rl/)**: use RL environments from Prime Intellect's Environments Hub with Tinker.
+- **[Paint with code](./paint_rl/)**: teach Inkling-Small to paint watercolors by writing p5.brush sketches, rewarded by a multimodal LLM-as-a-Verifier that compares the rendered images.
 - **[VLM image classification](./vlm_classifier/)**: train vision-language models as image classifiers.
 - **[Audio](./audio/)**: fine-tune audio-input models with SFT and RL — speech recognition, speaking-style classification, and medical-vocabulary domain adaptation.
 - **[Harbor RL](./harbor_rl/)**: RL training on Harbor-formatted tasks (e.g., Terminal-Bench) with sandboxed code execution.

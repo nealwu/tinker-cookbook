@@ -141,6 +141,65 @@ Useful metrics in `metrics.jsonl`:
 - `test/env/all/eval_strong/score` (in `heldout_eval/metrics.jsonl`): Gemini's held-out score, the headline number.
 - `test/env/tier3/...`, `test/env/novel_subject/...`: held-out metrics broken out by tier and by held-out kind.
 
+## Directed prompts (optional)
+
+`directives.py` adds a second prompt set: a base prompt followed by one or more
+directions of the kind a watercolour teacher gives, in five tiers that continue
+the subject tiers 1-3. For example, `Paint a teal heron standing in shallow
+water in wet-on-wet watercolor wash. Show it reflected upside down in still
+water across the lower half of the page, the reflection softer than the
+original.`
+
+| Tier | Direction | Example (appended to the base prompt) |
+|---|---|---|
+| 4 | Composition, placement, viewpoint | Place it small in the lower third, under a wide, empty sky laid in as one soft graded wash. |
+| 5 | Palette and value; a limited palette always includes the prompt's colour | Use a limited palette of just teal and coral, mixing the two for the darks, with the white paper as the only light. |
+| 6 | Technique, limited to what the brush allowlist can do (bleed, `fillTexture`, `hatch`, `field`, pencil, pen, charcoal) | Shade the shadows with fine hatched lines over the washes, the hatching closer together where the shadow is darkest. |
+| 7 | Light, mood, time of day | Make it stormy: heavy, dark clouds pile up behind it and a cold, uneasy light falls across the whole scene. |
+| 8 | Two or three of tiers 4-7 at once | Seen from below against a stormy sky, in a limited palette of teal and coral, with the clouds dark and heavy behind it. |
+
+Each tier has 18 hand-written training phrasings and 4 more reserved for
+held-out prompts; nothing is generated, and the set is deterministic in the
+seed. The phrasings are adapted from the BrushArena / BLOOM directive work.
+Every direction can be checked from the image alone, so the verifier's
+prompt-adherence criterion scores it with no change to the verifier. A
+direction is only paired with a base prompt it cannot contradict: sky
+directions skip interiors, tier-7 light skips subjects that set their own
+("at sunset"), full-bleed crops skip "lots of white paper", and a single warm
+or cool accent matches the prompt's colour. The held-out rules of `prompts.py`
+carry over: no novel subject, no word that only a novel subject uses, and no
+held-out (subject, colour, style) triple. `directives_test.py` checks this.
+
+Both settings default to 0, which leaves the prompts, tags and metrics exactly
+as before:
+
+```bash
+python -m tinker_cookbook.recipes.paint_rl.train log_path=/tmp/paint_rl/directed \
+    n_directed_prompts=256 n_directed_test=16
+```
+
+`n_directed_prompts=256` adds 256 directed prompts to the 256 base training
+prompts, balanced over tiers 4-8 (51-52 each), families, subjects, colours and
+styles. Batches draw from all 512, so each base prompt comes round half as
+often over the same number of steps. `n_directed_test=16` adds 16 held-out
+prompts of kind `novel_direction`: seen subjects, colours and styles with the
+reserved phrasings. `eval_checkpoints.py` reads both settings from the run's
+`config.json`.
+
+Directed prompts are tagged with their tier and with `directed` in place of
+the split:
+
+- `env/tier4/...` to `env/tier8/...`: training metrics per directed tier;
+  `env/directed/...` for all of them, `env/train/...` for the base prompts only.
+- `test/env/novel_direction/...` and `test/env/tier4/...` to `test/env/tier8/...`:
+  the directed held-out prompts.
+- **`n_directed_test > 0` changes `test/env/all/...`**: it then averages the 16
+  base held-out prompts and the directed ones. `test/env/test/...` still covers
+  only the 16 base held-out prompts (in a run without directed prompts it
+  equals `test/env/all/...`), so compare runs on
+  `test/env/test/eval_strong/score`. `test/env/novel_subject/...` and
+  `test/env/novel_combo/...` are unchanged.
+
 ## Results
 
 With the defaults, the held-out Gemini score rose from 3.24 to 5.35 out of 10
@@ -161,6 +220,7 @@ with many cores, local rendering is faster.
 | File | Purpose |
 |---|---|
 | `prompts.py` | System prompt (brush allowlist), prompt pool, and the pinned held-out split |
+| `directives.py` | Optional directed prompts: watercolour directions in tiers 4-8 on top of the base prompts |
 | `assets.py` | Pinned p5 / p5.brush sources, cached under `~/.cache/tinker-cookbook/paint_rl` |
 | `render.py` | Headless WebGL renderer and the compile / brush-use / blank gates |
 | `render_modal.py` | Optional Modal backend for the renderer |

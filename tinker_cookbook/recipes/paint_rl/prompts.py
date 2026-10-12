@@ -74,7 +74,7 @@ def system_prompt(canvas_size: int) -> str:
 # ---------------------------------------------------------------------------
 
 Family = Literal["flower", "animal", "object", "scene"]
-PromptKind = Literal["train", "novel_subject", "novel_combo"]
+PromptKind = Literal["train", "novel_subject", "novel_combo", "novel_direction"]
 
 
 @dataclass(frozen=True)

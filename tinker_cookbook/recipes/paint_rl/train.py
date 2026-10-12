@@ -84,6 +84,11 @@ class CLIConfig:
     # prompts split evenly into novel-subject and novel-combination halves.
     n_train_prompts: int = 256
     n_test_prompts: int = 16
+    # Directed prompts (directives.py), off by default: base prompts plus
+    # watercolour directions in tiers 4-8, added to the training prompts, and
+    # held-out ones with unseen phrasings added to the held-out prompts.
+    n_directed_prompts: int = 0
+    n_directed_test: int = 0
     test_group_size: int = 5
     canvas_size: int = 512
     render_concurrency: int = 16
@@ -172,6 +177,8 @@ async def cli_main(cli: CLIConfig) -> None:
         render_backend=cli.render_backend,
         n_train_prompts=cli.n_train_prompts,
         n_test_prompts=cli.n_test_prompts,
+        n_directed_prompts=cli.n_directed_prompts,
+        n_directed_test=cli.n_directed_test,
         test_group_size=cli.test_group_size,
         seed=cli.seed,
         artifact_dir=artifact_dir,

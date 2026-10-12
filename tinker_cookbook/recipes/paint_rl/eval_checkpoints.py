@@ -39,12 +39,9 @@ from tinker_cookbook.recipes.paint_rl.env import (
     PaintEnvGroupBuilder,
     PaintRLDataset,
     RewardWeights,
+    build_run_prompts,
 )
-from tinker_cookbook.recipes.paint_rl.prompts import (
-    PaintPrompt,
-    build_prompt_splits,
-    system_prompt,
-)
+from tinker_cookbook.recipes.paint_rl.prompts import PaintPrompt, system_prompt
 from tinker_cookbook.recipes.paint_rl.render import get_shared_renderer
 from tinker_cookbook.recipes.paint_rl.verifier import EvaluatorConfig, VerifierConfig
 from tinker_cookbook.renderers import get_renderer
@@ -139,11 +136,12 @@ class HeldoutEvaluator:
         self.model_name: str = run["model_name"]
         self.max_tokens: int = run["max_tokens"]
         self.renderer = get_renderer(data["renderer_name"], get_tokenizer(self.model_name))
-        _, self.test_prompts = build_prompt_splits(
+        _, self.test_prompts = build_run_prompts(
             n_train=data["n_train_prompts"],
-            n_test_novel_subject=data["n_test_prompts"] // 2,
-            n_test_novel_combo=data["n_test_prompts"] - data["n_test_prompts"] // 2,
+            n_test=data["n_test_prompts"],
             seed=data["seed"],
+            # Runs logged before directed prompts existed have no such field.
+            n_directed_test=data.get("n_directed_test", 0),
         )
         # Runs logged before the rename used judge_config / eval_judge_config.
         verifier_raw = data.get("verifier_config") or data["judge_config"]

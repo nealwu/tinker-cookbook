@@ -40,6 +40,11 @@ import tinker
 from PIL import Image
 
 from tinker_cookbook.completers import StopCondition
+from tinker_cookbook.recipes.paint_rl.directives import (
+    DIRECTED_TIERS,
+    build_directed_heldout,
+    build_directed_prompts,
+)
 from tinker_cookbook.recipes.paint_rl.prompts import (
     PaintPrompt,
     build_prompt_splits,
@@ -205,7 +210,11 @@ class PaintEnvGroupBuilder(EnvGroupBuilder):
         # The cookbook aggregates metrics per tag whenever a tag selects a
         # strict subset of the batch, so held-out metrics come out per tier
         # (test/env/tier3/...) and per kind (test/env/novel_subject/...).
-        tags = ["paint", self.split, f"tier{self.prompt.tier}"]
+        # Directed prompts (tiers 4-8) are tagged "directed" in place of the
+        # split, so env/train/... and test/env/test/... keep covering only the
+        # base prompts once directed ones are mixed in.
+        directed = self.prompt.tier in DIRECTED_TIERS
+        tags = ["paint", "directed" if directed else self.split, f"tier{self.prompt.tier}"]
         if self.prompt.kind != self.split:
             tags.append(self.prompt.kind)
         return tags
@@ -467,6 +476,32 @@ class PaintRLDataset(RLDataset):
         return self.n_batches
 
 
+def build_run_prompts(
+    n_train: int,
+    n_test: int,
+    seed: int,
+    n_directed: int = 0,
+    n_directed_test: int = 0,
+) -> tuple[list[PaintPrompt], list[PaintPrompt]]:
+    """A run's (train, test) prompts: the base split, then any directed prompts appended.
+
+    With no directed prompts this is exactly :func:`build_prompt_splits`.
+    Both directed sets are built against the base held-out prompts, so
+    neither reuses a held-out (subject, colour, style) triple.
+    """
+    train, test = build_prompt_splits(
+        n_train=n_train,
+        n_test_novel_subject=n_test // 2,
+        n_test_novel_combo=n_test - n_test // 2,
+        seed=seed,
+    )
+    directed = build_directed_prompts(n_directed, seed=seed, exclude=test) if n_directed else []
+    directed_test = (
+        build_directed_heldout(n_directed_test, seed=seed, exclude=test) if n_directed_test else []
+    )
+    return train + directed, test + directed_test
+
+
 @chz.chz
 class PaintRLDatasetBuilder(RLDatasetBuilder):
     model_name_for_tokenizer: str
@@ -487,17 +522,24 @@ class PaintRLDatasetBuilder(RLDatasetBuilder):
     # Held-out prompts, split evenly: half novel subjects (never trained on in
     # any form), half novel combinations of seen subject / colour / style.
     n_test_prompts: int = 16
+    # Directed prompts (directives.py): a base prompt plus watercolour
+    # directions in tiers 4-8, appended to the training prompts. 0 = off.
+    n_directed_prompts: int = 0
+    # Held-out directed prompts (kind novel_direction, phrasings never used in
+    # training), appended to the held-out prompts. 0 = off.
+    n_directed_test: int = 0
     test_group_size: int = 5
     seed: int = 0
     artifact_dir: str | None = None
 
     async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
         renderer = get_renderer(self.renderer_name, get_tokenizer(self.model_name_for_tokenizer))
-        train_prompts, test_prompts = build_prompt_splits(
+        train_prompts, test_prompts = build_run_prompts(
             n_train=self.n_train_prompts,
-            n_test_novel_subject=self.n_test_prompts // 2,
-            n_test_novel_combo=self.n_test_prompts - self.n_test_prompts // 2,
+            n_test=self.n_test_prompts,
             seed=self.seed,
+            n_directed=self.n_directed_prompts,
+            n_directed_test=self.n_directed_test,
         )
         logger.info(
             "Prompt split: train %s | test %s",

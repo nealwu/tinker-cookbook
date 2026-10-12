@@ -343,9 +343,7 @@ def build_prompt_splits(
     ]
     held = {p.id for p in test}
     train_pool = [
-        p
-        for p in pool
-        if p.id not in held and (train_skill_prompts or p.family != "skill")
+        p for p in pool if p.id not in held and (train_skill_prompts or p.family != "skill")
     ]
     train = _stratified_pick(train_pool, n_train, lambda p: p.subject, rng, balance=by_look)
     return train, test
